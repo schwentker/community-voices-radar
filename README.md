@@ -1,5 +1,7 @@
 # Community Voices Radar
 
+![status: early concept](https://img.shields.io/badge/status-early%20concept-orange) ![MCP](https://img.shields.io/badge/MCP-server-6b4fbb) ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178c6) ![Fly.io + Neon](https://img.shields.io/badge/deploy-Fly.io%20%2B%20Neon-8b5cf6)
+
 **MCP server giving AI agents real-time access to builder communities: Reddit, Slack, Discourse, Discord.**
 
 Aggregates posts → normalized schema → MCP tools. Deployed on Fly.io with Neon (serverless Postgres).
@@ -11,7 +13,19 @@ Connect it to Claude (or any MCP client) and ask:
 > *"Flag unanswered questions from the last 48 hours."*
 > *"Which integration pain points are trending, and where should they be routed?"*
 
-> **Status: early.** Reddit and Discourse ingestion are live code paths; Slack and Discord currently use a synthetic sample feed while connectors are built. Point it at any product, framework, or community via env vars.
+## Example session
+
+```text
+You:    What are developers asking this week?
+Agent:  → get_community_posts(type="question", limit=20)
+        12 questions across Reddit, Discourse, Discord. Top themes:
+        auth for remote MCP servers (4), rate limits on tool calls (3),
+        Postgres connection pooling on serverless (2).
+        → route_signal(type="integration_pain")
+        Recommended: escalate auth issues to engineering.
+```
+
+> **Status: early concept.** Server, MCP tools, Reddit and Discourse ingestion run today; Slack and Discord use a sample feed while connectors are built. Point it at any product, framework, or community via env vars.
 
 ---
 
