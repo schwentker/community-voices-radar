@@ -1,0 +1,30 @@
+{
+  "name": "community-voices-radar",
+  "version": "1.0.0",
+  "description": "MCP server giving AI agents real-time access to builder communities (Reddit, Slack, Discourse, Discord)",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch --env-file=.env src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "db:setup": "psql $DATABASE_URL < sql/schema.sql"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.7.0",
+    "@neondatabase/serverless": "^1.0.2",
+    "express": "^4.21.2",
+    "postgres": "^3.4.8",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
