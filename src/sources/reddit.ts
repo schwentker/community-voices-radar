@@ -1,14 +1,14 @@
 import { type CommunityPost } from "../data/community-posts.js";
-import { persistPost } from "../db/neon.js";
+import { inferIntent } from "../config/classify.js";
+
+// Reddit adapter: query in, normalized posts out. No persistence and no
+// module-level state, so the scan runner and the dry-run preview share it.
 
 const REDDIT_SEARCH_BASE_URL = "https://www.reddit.com/search.json";
-// Override with REDDIT_SEARCH_QUERY to track any community, product, or topic.
-const DEFAULT_SEARCH_QUERY = process.env["REDDIT_SEARCH_QUERY"] ?? "\"model context protocol\" OR mcp server";
-const DEFAULT_PAGE_SIZE = 10;
 const MAX_SELF_TEXT_LENGTH = 200;
+const USER_AGENT = "community-voices-radar/1.0 (+https://github.com/schwentker/community-voices-radar)";
 
-let searchAfterCursor: string | null = null;
-let activeSearchQuery = DEFAULT_SEARCH_QUERY;
+export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 interface RedditSearchChild {
   data: {
@@ -18,6 +18,7 @@ interface RedditSearchChild {
     selftext?: string;
     created_utc?: number;
     subreddit?: string;
+    permalink?: string;
     score?: number;
     num_comments?: number;
     promoted?: boolean;
@@ -33,38 +34,30 @@ interface RedditSearchResponse {
   };
 }
 
-function getSearchUrl(query: string, after: string | null, limit: number): string {
-  const params = new URLSearchParams({
-    q: query,
-    sort: "new",
-    limit: String(limit),
-  });
+export interface RedditSearchOptions {
+  limit?: number;
+  after?: string | null;
+  painKeywords?: string[];
+  fetchImpl?: FetchLike;
+}
 
+export interface RedditSearchResult {
+  posts: CommunityPost[];
+  after: string | null;
+  status: "ok" | "rate_limited" | "error";
+}
+
+export function getSearchUrl(query: string, after: string | null, limit: number): string {
+  const params = new URLSearchParams({ q: query, sort: "new", limit: String(limit) });
   if (after) {
     params.set("after", after);
   }
-
   return `${REDDIT_SEARCH_BASE_URL}?${params.toString()}`;
 }
 
 function truncateText(value: string, maxLength: number): string {
   const normalized = value.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxLength) {
-    return normalized;
-  }
-
-  return `${normalized.slice(0, maxLength).trimEnd()}...`;
-}
-
-function buildContent(title: string, selfText: string): string {
-  const normalizedTitle = title.trim();
-  const normalizedSelfText = truncateText(selfText, MAX_SELF_TEXT_LENGTH);
-
-  if (!normalizedSelfText) {
-    return normalizedTitle;
-  }
-
-  return `${normalizedTitle} ${normalizedSelfText}`.trim();
+  return normalized.length <= maxLength ? normalized : `${normalized.slice(0, maxLength).trimEnd()}...`;
 }
 
 function isDeletedValue(value: string): boolean {
@@ -73,44 +66,16 @@ function isDeletedValue(value: string): boolean {
 }
 
 function hasMeaningfulContent(title: string, selfText: string): boolean {
-  const normalizedTitle = title.trim();
-  const normalizedSelfText = selfText.trim();
-
-  if (!normalizedTitle && !normalizedSelfText) {
-    return false;
-  }
-
-  if (normalizedTitle && !isDeletedValue(normalizedTitle)) {
+  if (title && !isDeletedValue(title)) {
     return true;
   }
-
-  return Boolean(normalizedSelfText && !isDeletedValue(normalizedSelfText));
+  return Boolean(selfText && !isDeletedValue(selfText));
 }
 
-function inferIntent(title: string, content: string): CommunityPost["type"] {
-  const text = `${title} ${content}`.toLowerCase();
-
-  if (text.includes("feature") || text.includes("request")) {
-    return "feature_request";
-  }
-
-  if (title.trim().endsWith("?") || content.includes("?")) {
-    return "question";
-  }
-
-  if (
-    text.includes("integration") ||
-    text.includes("zapier") ||
-    text.includes("n8n") ||
-    text.includes("salesforce")
-  ) {
-    return "integration_pain";
-  }
-
-  return "discussion";
-}
-
-function normalizePost(child: RedditSearchChild): CommunityPost | null {
+export function normalizeRedditChild(
+  child: RedditSearchChild,
+  painKeywords: string[] = [],
+): CommunityPost | null {
   const post = child.data;
   const title = post.title?.trim() ?? "";
   const selfText = post.selftext?.trim() ?? "";
@@ -118,12 +83,12 @@ function normalizePost(child: RedditSearchChild): CommunityPost | null {
   if (post.promoted || post.is_ad || post.over_18) {
     return null;
   }
-
   if (!post.id || !post.created_utc || !hasMeaningfulContent(title, selfText)) {
     return null;
   }
 
-  const content = buildContent(title, selfText);
+  const body = truncateText(selfText, MAX_SELF_TEXT_LENGTH);
+  const content = (body ? `${title} ${body}` : title).trim();
   if (!content) {
     return null;
   }
@@ -138,11 +103,12 @@ function normalizePost(child: RedditSearchChild): CommunityPost | null {
     author: post.author?.trim() || "unknown",
     region: "unknown",
     content,
-    type: inferIntent(title, content),
+    type: inferIntent(title, content, painKeywords),
     timestamp: new Date(post.created_utc * 1000).toISOString(),
     source: "reddit_live",
     meta: {
       subreddit: post.subreddit ?? "unknown",
+      ...(post.permalink ? { url: `https://www.reddit.com${post.permalink}` } : {}),
       score,
       comments,
       rank: score + comments * 2,
@@ -150,64 +116,32 @@ function normalizePost(child: RedditSearchChild): CommunityPost | null {
   };
 }
 
-async function persistNormalizedPosts(posts: CommunityPost[]): Promise<void> {
-  await Promise.all(
-    posts.map(async (post) => {
-      try {
-        await persistPost(post);
-        console.log("persisted_post", post.id);
-      } catch (error) {
-        console.error(`[reddit] Failed to persist post ${post.id}`, error);
-      }
-    })
-  );
-}
-
-export async function fetchRedditPosts(): Promise<CommunityPost[]> {
-  const requestUrl = getSearchUrl(activeSearchQuery, searchAfterCursor, DEFAULT_PAGE_SIZE);
-
+export async function searchReddit(
+  query: string,
+  { limit = 25, after = null, painKeywords = [], fetchImpl = fetch }: RedditSearchOptions = {},
+): Promise<RedditSearchResult> {
   try {
-    const response = await fetch(requestUrl, {
-      headers: {
-        Accept: "application/json",
-        "User-Agent": "community-voices-radar/1.0 (+https://github.com/schwentker/community-voices-radar)",
-      },
+    const response = await fetchImpl(getSearchUrl(query, after, limit), {
+      headers: { Accept: "application/json", "User-Agent": USER_AGENT },
     });
 
     if (response.status === 429) {
-      console.warn("[reddit] Rate limited while fetching search results");
-      return [];
+      console.warn("[reddit] Rate limited");
+      return { posts: [], after: null, status: "rate_limited" };
     }
-
     if (!response.ok) {
-      console.error(`[reddit] Failed to fetch search results: ${response.status} ${response.statusText}`);
-      return [];
+      console.error(`[reddit] Search failed: ${response.status} ${response.statusText}`);
+      return { posts: [], after: null, status: "error" };
     }
 
-    const payload = (await response.json()) as RedditSearchResponse;
-    const listing = payload.data;
-    const children = listing?.children ?? [];
-
-    const after = listing?.after ?? null;
-    searchAfterCursor = after;
-
-    if (searchAfterCursor === null) {
-      // Resetting here allows the next poll cycle to start over with the newest page.
-      activeSearchQuery = DEFAULT_SEARCH_QUERY;
-    }
-
-    const posts = children
-      .map((child) => normalizePost(child))
+    const listing = ((await response.json()) as RedditSearchResponse).data;
+    const posts = (listing?.children ?? [])
+      .map((child) => normalizeRedditChild(child, painKeywords))
       .filter((post): post is CommunityPost => post !== null);
 
-    console.log("reddit_fetch_count", posts.length);
-    console.log("after_cursor", after);
-
-    await persistNormalizedPosts(posts);
-
-    return posts;
+    return { posts, after: listing?.after ?? null, status: "ok" };
   } catch (error) {
-    console.error("[reddit] Failed to fetch Reddit posts", error);
-    return [];
+    console.error("[reddit] Search request failed", error);
+    return { posts: [], after: null, status: "error" };
   }
 }

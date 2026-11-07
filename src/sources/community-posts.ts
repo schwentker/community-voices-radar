@@ -1,55 +1,26 @@
-import {
-  COMMUNITY_POSTS,
-  type CommunityPlatform,
-  type CommunityPost,
-  type CommunityPostType,
-  type CommunityRegion,
-} from "../data/community-posts.js";
-import { fetchRedditPosts } from "./reddit.js";
-import { fetchDiscoursePosts } from "./discourse.js";
+import { COMMUNITY_POSTS } from "../data/community-posts.js";
+import type { PostQuery, Store, StoredPost } from "../store/types.js";
 
-export interface CommunityPostResult extends CommunityPost {
-  source: string;
-}
+export type CommunityPostResult = StoredPost;
+export type CommunityPostFilters = PostQuery;
 
-export interface CommunityPostFilters {
-  platform?: CommunityPlatform | "all";
-  region?: CommunityRegion | "all";
-  type?: CommunityPostType | "all";
-  limit?: number;
-}
+// Reads what scans stored. Fetching from Reddit/Discourse happens only in a
+// scan (on demand or weekly), never on a read request.
+export async function getCommunityPosts(
+  store: Store,
+  filters: CommunityPostFilters = {},
+): Promise<CommunityPostResult[]> {
+  const [{ settings }, stored] = await Promise.all([store.getConfig(), store.listPosts(filters)]);
 
-function withSource(posts: CommunityPost[], source: string): CommunityPostResult[] {
-  return posts.map((post) => ({ ...post, source: post.source ?? source }));
-}
-
-export async function getCommunityPosts({
-  platform = "all",
-  region = "all",
-  type = "all",
-  limit,
-}: CommunityPostFilters = {}): Promise<CommunityPostResult[]> {
-  const [redditPosts, discoursePosts] = await Promise.all([
-    fetchRedditPosts(),
-    fetchDiscoursePosts().catch(() => []),
-  ]);
-
-  const mergedPosts = [
-    ...withSource(COMMUNITY_POSTS, "synthetic"),
-    ...withSource(redditPosts, "reddit_live"),
-    ...withSource(discoursePosts, "discourse_live"),
-  ]
-    .filter((post) => {
-      const platformMatches = platform === "all" || post.platform === platform;
-      const regionMatches = region === "all" || post.region === region;
-      const typeMatches = type === "all" || post.type === type;
-      return platformMatches && regionMatches && typeMatches;
-    })
-    .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
-
-  if (limit && limit > 0) {
-    return mergedPosts.slice(0, limit);
+  if (!settings.includeSynthetic || filters.entity) {
+    return stored;
   }
 
-  return mergedPosts;
+  const synthetic = COMMUNITY_POSTS.map((post) => ({ ...post, source: "synthetic", entities: [] }))
+    .filter((post) => !filters.platform || filters.platform === "all" || post.platform === filters.platform)
+    .filter((post) => !filters.region || filters.region === "all" || post.region === filters.region)
+    .filter((post) => !filters.type || filters.type === "all" || post.type === filters.type);
+
+  const merged = [...stored, ...synthetic].sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+  return filters.limit ? merged.slice(0, filters.limit) : merged;
 }

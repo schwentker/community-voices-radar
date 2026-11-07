@@ -25,7 +25,7 @@ Agent:  → get_community_posts(type="question", limit=20)
         Recommended: escalate auth issues to engineering.
 ```
 
-> **Status: early concept.** Server, MCP tools, Reddit and Discourse ingestion run today; Slack and Discord use a sample feed while connectors are built. Point it at any product, framework, or community via env vars.
+> **Status: early concept.** Server, MCP tools, Reddit and Discourse ingestion run today; Slack and Discord use a sample feed while connectors are built. Point it at any company and its competitors from the Watchlist panel.
 
 ---
 
@@ -45,9 +45,11 @@ Claude / any MCP client
         ▼ MCP (SSE)
 community-voices-radar (Fly.io)
         │
-        ├── Sources
-        │       ├── Reddit search      (live, REDDIT_SEARCH_QUERY)
-        │       ├── Discourse forums   (live, DISCOURSE_BASE_URLS)
+        ├── Watchlist   (companies + competitors, aliases, sources; Neon or local file)
+        │
+        ├── Scan runner (on demand, MCP run_scan, weekly schedule)
+        │       ├── Reddit search      (live, query derived per company)
+        │       ├── Discourse forums   (live, per company)
         │       ├── Slack              (synthetic sample, connector planned)
         │       └── Discord            (synthetic sample, connector planned)
         │
@@ -55,15 +57,38 @@ community-voices-radar (Fly.io)
         │
         ├── MCP tools
         │       ├── get_community_posts
+        │       ├── list_watchlist
+        │       ├── compare_entities
+        │       ├── run_scan
         │       └── route_signal
         │
         ├── HTTP
         │       ├── GET /health
         │       ├── GET /community-posts
+        │       ├── GET|PUT|DELETE /config/...   (watchlist)
+        │       ├── POST /config/preview         (dry run)
+        │       ├── POST /scan, GET /scan/runs
         │       └── GET /insights/acknowledged
         │
-        └── Neon Postgres  (posts, members, post_tags)
+        └── Neon Postgres  (posts, post_entities, watch_entities, radar_settings, scan_runs)
 ```
+
+---
+
+## Watchlist
+
+Open the radar UI and click **Set up watchlist** (or **Edit watchlist**):
+
+- **Presets**: one click for *Shopify*, *Shopify + competitors* (BigCommerce, WooCommerce, Wix, Squarespace), or *MCP builders*. Presets only add companies you don't have.
+- **Companies**: name, primary or competitor, aliases, excludes (e.g. stock chatter), pain keywords, optional subreddits, optional Discourse forums, or a custom Reddit query.
+- **Dry run**: shows the derived Reddit query and live sample hits before you save.
+- **Scans**: *Run scan now*, plus a weekly scan (default Sunday 9:00 America/Los_Angeles). The weekly scan runs only while the server is up.
+
+Each company becomes a Reddit query like `(Shopify OR "shopify plus") NOT stock`. Every stored post is tagged with each company it mentions, so a "Shopify vs WooCommerce" thread counts for both.
+
+Storage: Neon when `DATABASE_URL` is set (tables are created at boot). Without it, the watchlist is saved to `data/watchlist.local.json` and posts stay in memory, which is handy for local tries. On first boot, `REDDIT_SEARCH_QUERY` / `DISCOURSE_BASE_URLS` seed a "Default watch" entry once; after that the watchlist wins.
+
+Config writes are local-only (loopback) unless `COMM_VOICES_API_TOKEN` is set, and browser writes must come from an origin in `CORS_ORIGINS`.
 
 ---
 
@@ -73,10 +98,18 @@ community-voices-radar (Fly.io)
 
 | Parameter | Type | Options |
 |-----------|------|---------|
+| entity | string | watchlist id, e.g. shopify (optional) |
 | platform | string | reddit, slack, discourse, discord, all |
 | region | string | us, europe, india, japan, brazil, unknown, all |
 | type | string | question, feature_request, integration_pain, discussion, announcement, all |
+| days | integer | 1-90 (optional) |
 | limit | integer | 1-100 |
+
+**`list_watchlist`**: companies being monitored and the Reddit query each uses.
+
+**`compare_entities`**: share of voice per company over N days, by type, with top posts.
+
+**`run_scan`**: fetch fresh posts now for all (or some) companies.
 
 **`route_signal`**: ranks stored posts by engagement, detects themes, and recommends a routing action (product backlog vs engineering escalation). If `SIGNAL_WEBHOOK_URL` is set, the top signals are POSTed there (Slack incoming webhook, n8n, Zapier, or your own service).
 
@@ -120,9 +153,13 @@ git clone https://github.com/schwentker/community-voices-radar
 cd community-voices-radar
 nvm use 20
 npm install
-cp .env.example .env      # set DATABASE_URL, REDDIT_SEARCH_QUERY, DISCOURSE_BASE_URLS
-npm run db:setup
+cp .env.example .env      # DATABASE_URL optional for local tries
+npm run db:setup          # only with DATABASE_URL
 npm run dev
+npm test
+
+# UI (second terminal)
+cd apps/radar-ui && npm install && npm run dev   # http://localhost:5173, talks to localhost:3000
 ```
 
 Inspect with MCP Inspector:

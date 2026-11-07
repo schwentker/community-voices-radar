@@ -1,8 +1,11 @@
-import { startTransition, useEffect, useMemo, useState } from "react";
+import { startTransition, useCallback, useEffect, useMemo, useState } from "react";
+
+import { api, type RadarConfig } from "./api";
+import { WatchlistPanel } from "./Watchlist";
 
 type Platform = "all" | "discourse" | "discord" | "slack" | "reddit";
 type Region = "all" | "us" | "europe" | "india" | "japan" | "brazil";
-type PostType = "all" | "question" | "feature_request" | "announcement";
+type PostType = "all" | "question" | "feature_request" | "integration_pain" | "announcement";
 
 interface CommunityPost {
   id: string;
@@ -13,6 +16,8 @@ interface CommunityPost {
   type: Exclude<PostType, "all"> | string;
   timestamp: string;
   source?: string;
+  entities?: string[];
+  meta?: { url?: string };
 }
 
 type RouteStatus = "idle" | "sending" | "sent" | "error";
@@ -38,6 +43,7 @@ const TYPE_OPTIONS: { label: string; value: PostType }[] = [
   { label: "All", value: "all" },
   { label: "Questions", value: "question" },
   { label: "Feature Requests", value: "feature_request" },
+  { label: "Pain Points", value: "integration_pain" },
   { label: "Announcements", value: "announcement" },
 ];
 
@@ -76,16 +82,17 @@ const REGION_LABELS: Record<string, string> = {
 const TYPE_LABELS: Record<string, string> = {
   question: "Question",
   feature_request: "Feature Request",
+  integration_pain: "Pain Point",
   announcement: "Announcement",
 };
 
 const TYPE_COLORS: Record<string, string> = {
   question: "#F97316",
   feature_request: "#0F9D91",
+  integration_pain: "#E11D48",
   announcement: "#6B4FBB",
 };
 
-const COMMUNITY_POSTS_URL = "https://community-voices-radar.fly.dev/community-posts";
 
 function truncateContent(text: string, maxLength = 150): string {
   if (text.length <= maxLength) {
@@ -213,59 +220,68 @@ function App() {
   const [platform, setPlatform] = useState<Platform>("all");
   const [region, setRegion] = useState<Region>("all");
   const [type, setType] = useState<PostType>("all");
+  const [entity, setEntity] = useState<string>("all");
+  const [config, setConfig] = useState<RadarConfig | null>(null);
+  const [watchlistOpen, setWatchlistOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [routeStatus, setRouteStatus] = useState<Record<string, RouteStatus>>({});
 
-  useEffect(() => {
-    const controller = new AbortController();
-
-    const loadPosts = async () => {
-      setIsLoading(true);
-      setError(null);
-
-      try {
-        const response = await fetch(COMMUNITY_POSTS_URL, {
-          headers: { Accept: "application/json" },
-          signal: controller.signal,
-        });
-
-        if (!response.ok) {
-          throw new Error(`Request failed with ${response.status}`);
-        }
-
-        const data = (await response.json()) as CommunityPost[];
-        startTransition(() => {
-          setPosts(Array.isArray(data) ? data : []);
-        });
-      } catch (err) {
-        if (controller.signal.aborted) {
-          return;
-        }
-
-        setError(err instanceof Error ? err.message : "Unable to load community posts");
-      } finally {
-        if (!controller.signal.aborted) {
-          setIsLoading(false);
-        }
-      }
-    };
-
-    void loadPosts();
-
-    return () => {
-      controller.abort();
-    };
+  const loadConfig = useCallback(async () => {
+    try {
+      const next = await api.config();
+      setConfig(next);
+      if (next.entities.length === 0) setWatchlistOpen(true);
+    } catch {
+      setConfig(null);
+    }
   }, []);
+
+  const loadPosts = useCallback(async () => {
+    setError(null);
+    try {
+      const data = (await api.posts()) as CommunityPost[];
+      startTransition(() => {
+        setPosts(Array.isArray(data) ? data : []);
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to load community posts");
+    }
+  }, []);
+
+  useEffect(() => {
+    setIsLoading(true);
+    void Promise.all([loadConfig(), loadPosts()]).finally(() => setIsLoading(false));
+  }, [loadConfig, loadPosts]);
+
+  const entities = config?.entities ?? [];
+  const entityById = useMemo(() => new Map(entities.map((item) => [item.id, item])), [entities]);
+  const entityOptions = useMemo(
+    () => [{ label: "All", value: "all" }, ...entities.map((item) => ({ label: item.name, value: item.id }))],
+    [entities]
+  );
 
   const scopedPosts = useMemo(() => {
     return posts.filter((post) => {
       const matchesPlatform = platform === "all" || post.platform === platform;
       const matchesRegion = region === "all" || post.region === region;
+      const matchesEntity = entity === "all" || (post.entities ?? []).includes(entity);
+      return matchesPlatform && matchesRegion && matchesEntity;
+    });
+  }, [entity, platform, posts, region]);
+
+  const mentionsByEntity = useMemo(() => {
+    const base = posts.filter((post) => {
+      const matchesPlatform = platform === "all" || post.platform === platform;
+      const matchesRegion = region === "all" || post.region === region;
       return matchesPlatform && matchesRegion;
     });
-  }, [platform, posts, region]);
+    return entities
+      .map((item) => [item, base.filter((post) => (post.entities ?? []).includes(item.id)).length] as const)
+      .sort((left, right) => right[1] - left[1]);
+  }, [entities, platform, posts, region]);
+  const maxMentions = Math.max(...mentionsByEntity.map(([, count]) => count), 1);
 
   const filteredPosts = useMemo(() => {
     return scopedPosts.filter((post) => {
@@ -294,7 +310,7 @@ function App() {
         }
         return accumulator;
       },
-      { question: 0, feature_request: 0, announcement: 0 }
+      { question: 0, feature_request: 0, integration_pain: 0, announcement: 0 }
     );
   }, [scopedPosts]);
 
@@ -313,26 +329,8 @@ function App() {
 
   const refreshPosts = async () => {
     setIsRefreshing(true);
-    setError(null);
-
-    try {
-      const response = await fetch(COMMUNITY_POSTS_URL, {
-        headers: { Accept: "application/json" },
-      });
-
-      if (!response.ok) {
-        throw new Error(`Refresh failed with ${response.status}`);
-      }
-
-      const data = (await response.json()) as CommunityPost[];
-      startTransition(() => {
-        setPosts(Array.isArray(data) ? data : []);
-      });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to refresh community posts");
-    } finally {
-      setIsRefreshing(false);
-    }
+    await loadPosts();
+    setIsRefreshing(false);
   };
 
   const routeToProduct = async (post: CommunityPost) => {
@@ -362,7 +360,7 @@ function App() {
           <div className="relative flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
             <div className="max-w-3xl">
               <div className="mb-3 inline-flex rounded-full border border-white/20 bg-white/10 px-3 py-1 text-xs font-semibold uppercase tracking-[0.28em] text-white/80">
-                MCP + Recipes + Genies
+                {config?.settings.workspaceName ?? "Community Voices"}
               </div>
               <h1 className="font-display text-4xl font-bold tracking-tight sm:text-5xl">
                 Community Voices Radar
@@ -370,6 +368,25 @@ function App() {
               <p className="mt-3 max-w-2xl text-base text-white/84 sm:text-lg">
                 Live intelligence across Discourse, Discord, Slack &amp; Reddit
               </p>
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                {entities.map((item) => (
+                  <span
+                    key={item.id}
+                    className="inline-flex items-center gap-2 rounded-full border border-white/20 bg-white/10 px-3 py-1 text-sm"
+                  >
+                    <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: item.color }} />
+                    {item.name}
+                    {item.role === "primary" ? <span className="text-xs text-white/60">primary</span> : null}
+                  </span>
+                ))}
+                <button
+                  type="button"
+                  onClick={() => setWatchlistOpen(true)}
+                  className="rounded-full bg-white px-4 py-1.5 text-sm font-semibold text-radar-purple shadow-sm transition hover:bg-violet-50"
+                >
+                  {entities.length ? "Edit watchlist" : "Set up watchlist"}
+                </button>
+              </div>
             </div>
             <div className="grid gap-3 sm:grid-cols-3">
               <div className="rounded-2xl border border-white/15 bg-white/10 px-4 py-3 backdrop-blur">
@@ -389,7 +406,10 @@ function App() {
         </header>
 
         <section className="mt-6 grid gap-3 xl:grid-cols-[1fr_auto]">
-          <div className="grid gap-3 lg:grid-cols-3">
+          <div className={["grid gap-3", entities.length ? "lg:grid-cols-2 2xl:grid-cols-4" : "lg:grid-cols-3"].join(" ")}>
+            {entities.length ? (
+              <FilterGroup label="Company" value={entity} options={entityOptions} onChange={setEntity} />
+            ) : null}
             <FilterGroup label="Platform" value={platform} options={PLATFORM_OPTIONS} onChange={setPlatform} />
             <FilterGroup label="Region" value={region} options={REGION_OPTIONS} onChange={setRegion} />
             <FilterGroup label="Type" value={type} options={TYPE_OPTIONS} onChange={setType} />
@@ -412,7 +432,7 @@ function App() {
               <div>
                 <h2 className="font-display text-2xl font-semibold text-radar-ink">Community feed</h2>
                 <p className="mt-1 text-sm text-slate-600">
-                  Unified signal stream from live and synthetic community sources.
+                  Posts stored by scans. Run a scan from the watchlist to pull fresh ones.
                 </p>
               </div>
               <button
@@ -427,7 +447,7 @@ function App() {
 
             {error ? (
               <div className="rounded-[28px] border border-rose-200 bg-rose-50 p-5 text-sm text-rose-700">
-                {error}. The static demo fetches community posts directly from `community-voices-radar.fly.dev`.
+                {error}. Is the radar server running? Set VITE_API_BASE to point the UI at it.
               </div>
             ) : null}
 
@@ -439,7 +459,17 @@ function App() {
               </div>
             ) : filteredPosts.length === 0 ? (
               <div className="rounded-[28px] border border-[color:var(--radar-line)] bg-white/80 p-8 text-center text-slate-600 shadow-sm">
-                No posts match the current filters.
+                {posts.length === 0 ? (
+                  <>
+                    No posts yet.{" "}
+                    <button type="button" className="font-semibold text-radar-purple underline" onClick={() => setWatchlistOpen(true)}>
+                      Open the watchlist
+                    </button>{" "}
+                    and run a scan.
+                  </>
+                ) : (
+                  "No posts match the current filters."
+                )}
               </div>
             ) : (
               <div className="grid gap-4">
@@ -469,6 +499,18 @@ function App() {
                             <span className="inline-flex rounded-full bg-slate-900 px-3 py-1 text-xs font-medium text-white">
                               {TYPE_LABELS[post.type] ?? post.type}
                             </span>
+                            {(post.entities ?? []).map((entityId) => {
+                              const tagged = entityById.get(entityId);
+                              return (
+                                <span
+                                  key={entityId}
+                                  className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700"
+                                >
+                                  <span className="h-2 w-2 rounded-full" style={{ backgroundColor: tagged?.color ?? "#94a3b8" }} />
+                                  {tagged?.name ?? entityId}
+                                </span>
+                              );
+                            })}
                           </div>
                           <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-slate-500">
                             <span className="font-semibold text-slate-800">{post.author}</span>
@@ -482,7 +524,15 @@ function App() {
                               {isLiveSource(post.source) ? "live" : "synthetic"}
                             </span>
                           </div>
-                          <p className="text-[15px] leading-7 text-slate-700">{truncateContent(post.content)}</p>
+                          <p className="text-[15px] leading-7 text-slate-700">
+                            {post.meta?.url ? (
+                              <a href={post.meta.url} target="_blank" rel="noreferrer" className="hover:text-radar-purple hover:underline">
+                                {truncateContent(post.content)}
+                              </a>
+                            ) : (
+                              truncateContent(post.content)
+                            )}
+                          </p>
                         </div>
 
                         {post.type === "feature_request" ? (
@@ -526,6 +576,25 @@ function App() {
               </div>
 
               <div className="space-y-5">
+                {mentionsByEntity.length ? (
+                  <div>
+                    <div className="mb-3 text-sm font-semibold uppercase tracking-[0.22em] text-slate-500">Mentions by company</div>
+                    <div className="space-y-3">
+                      {mentionsByEntity.map(([item, count]) => (
+                        <div key={item.id}>
+                          <div className="mb-1 flex items-center justify-between text-sm text-slate-700">
+                            <span>{item.name}</span>
+                            <span className="font-semibold">{count}</span>
+                          </div>
+                          <div className="h-2 rounded-full bg-slate-100">
+                            <div className="h-2 rounded-full" style={{ width: `${(count / maxMentions) * 100}%`, backgroundColor: item.color }} />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
                 <div>
                   <div className="mb-3 text-sm font-semibold uppercase tracking-[0.22em] text-slate-500">Top regions</div>
                   <div className="space-y-3">
@@ -578,7 +647,7 @@ function App() {
                   <div className="rounded-[24px] bg-[linear-gradient(135deg,#0f9d91,#34c8b2)] p-4 text-white">
                     <div className="text-xs uppercase tracking-[0.22em] text-white/70">Feature requests</div>
                     <div className="mt-2 text-3xl font-semibold">{featureRequests.length}</div>
-                    <div className="mt-2 text-sm text-white/80">Signals ready for recipe routing.</div>
+                    <div className="mt-2 text-sm text-white/80">Signals ready for product routing.</div>
                   </div>
                   <div className="rounded-[24px] bg-[linear-gradient(135deg,#f97316,#fb923c)] p-4 text-white">
                     <div className="text-xs uppercase tracking-[0.22em] text-white/70">Unanswered questions</div>
@@ -648,6 +717,13 @@ function App() {
           </aside>
         </main>
       </div>
+      <WatchlistPanel
+        open={watchlistOpen}
+        config={config}
+        onClose={() => setWatchlistOpen(false)}
+        onChanged={() => void loadConfig()}
+        onScanned={() => void loadPosts()}
+      />
     </div>
   );
 }

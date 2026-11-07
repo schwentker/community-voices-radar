@@ -43,7 +43,8 @@ export function generateFingerprint(content: string): string {
   return createHash("sha1").update(normalized).digest("hex");
 }
 
-export async function persistPost(post: CommunityPost): Promise<void> {
+/** Upserts a post. Returns the id it lives under (a near-duplicate merges into an existing row). */
+export async function persistPost(post: CommunityPost): Promise<string> {
   const db = getNeonClient();
   const fingerprint = generateFingerprint(post.content);
   const ingestedAt = new Date().toISOString();
@@ -79,7 +80,7 @@ export async function persistPost(post: CommunityPost): Promise<void> {
       WHERE id = ${duplicatePost.id}
     `;
 
-    return;
+    return duplicatePost.id;
   }
 
   const enrichedMeta = {
@@ -128,4 +129,6 @@ export async function persistPost(post: CommunityPost): Promise<void> {
       fingerprint = EXCLUDED.fingerprint,
       updated_at = NOW()
   `;
+
+  return post.id;
 }
