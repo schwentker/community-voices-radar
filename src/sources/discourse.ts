@@ -1,12 +1,9 @@
 import { type CommunityPost } from "../data/community-posts.js";
-import { persistPost } from "../db/neon.js";
+import { inferIntent } from "../config/classify.js";
+import type { FetchLike } from "./reddit.js";
 
-// Comma-separated list of public Discourse forums, e.g.
-// DISCOURSE_BASE_URLS=https://forum.example.com,https://community.example.org
-const DISCOURSE_BASE_URLS = (process.env["DISCOURSE_BASE_URLS"] ?? "")
-  .split(",")
-  .map((url) => url.trim().replace(/\/+$/, ""))
-  .filter(Boolean);
+// Discourse adapter: forum URL in, normalized posts out. Forums come from each
+// watchlist entity (sources.discourse.forums), not from env.
 
 interface DiscourseUser {
   id: number;
@@ -26,18 +23,18 @@ interface DiscourseLatestResponse {
   topic_list?: { topics?: DiscourseTopic[] };
 }
 
-function normalizeDiscourseTopics(
+export function normalizeDiscourseTopics(
   baseUrl: string,
   payload: DiscourseLatestResponse,
   limit: number,
+  painKeywords: string[] = [],
 ): CommunityPost[] {
   const usernames = new Map((payload.users ?? []).map((user) => [user.id, user.username]));
   const host = new URL(baseUrl).host;
 
   return (payload.topic_list?.topics ?? []).slice(0, limit).map((topic) => {
     const originalPoster =
-      topic.posters?.find((poster) => poster.description?.includes("Original Poster")) ??
-      topic.posters?.[0];
+      topic.posters?.find((poster) => poster.description?.includes("Original Poster")) ?? topic.posters?.[0];
     const externalId = `${host}:${topic.id}`;
 
     return {
@@ -47,7 +44,7 @@ function normalizeDiscourseTopics(
       author: (originalPoster && usernames.get(originalPoster.user_id)) ?? "unknown",
       region: "unknown",
       content: topic.title,
-      type: topic.title.trim().endsWith("?") ? "question" : "discussion",
+      type: inferIntent(topic.title, "", painKeywords),
       timestamp: new Date(topic.created_at).toISOString(),
       source: "discourse_live",
       meta: { url: `${baseUrl}/t/${topic.slug}/${topic.id}`, forum: host },
@@ -55,43 +52,26 @@ function normalizeDiscourseTopics(
   });
 }
 
-async function persistNormalizedPosts(posts: CommunityPost[]): Promise<void> {
-  await Promise.all(
-    posts.map(async (post) => {
-      try {
-        await persistPost(post);
-      } catch (error) {
-        console.error(`[discourse] Failed to persist post ${post.id}`, error);
-      }
-    }),
-  );
-}
-
-async function fetchForum(baseUrl: string, limit: number): Promise<CommunityPost[]> {
+export async function fetchForumTopics(
+  baseUrl: string,
+  { limit = 25, painKeywords = [], fetchImpl = fetch }: { limit?: number; painKeywords?: string[]; fetchImpl?: FetchLike } = {},
+): Promise<CommunityPost[]> {
   try {
-    const response = await fetch(`${baseUrl}/latest.json?order=created`, {
+    const response = await fetchImpl(`${baseUrl}/latest.json?order=created`, {
       headers: { Accept: "application/json" },
     });
-
     if (!response.ok) {
       console.error(`[discourse] ${baseUrl} returned ${response.status}`);
       return [];
     }
-
-    const posts = normalizeDiscourseTopics(
+    return normalizeDiscourseTopics(
       baseUrl,
       (await response.json()) as DiscourseLatestResponse,
       limit,
+      painKeywords,
     );
-    await persistNormalizedPosts(posts);
-    return posts;
   } catch (error) {
     console.error(`[discourse] Failed to fetch ${baseUrl}`, error);
     return [];
   }
-}
-
-export async function fetchDiscoursePosts(limit = 10): Promise<CommunityPost[]> {
-  const results = await Promise.all(DISCOURSE_BASE_URLS.map((url) => fetchForum(url, limit)));
-  return results.flat();
 }

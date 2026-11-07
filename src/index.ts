@@ -2,98 +2,40 @@ import express, { Request, Response } from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 
-import { closeNeonClient, getNeonClient } from "./db/neon.js";
-import {
-  COMMUNITY_PLATFORMS,
-  COMMUNITY_REGIONS,
-  COMMUNITY_TYPES,
-} from "./data/community-posts.js";
-import { getCommunityPosts } from "./sources/community-posts.js";
+import { createApiRouter } from "./http/api.js";
+import { startWeeklySchedule } from "./scan.js";
+import { createStore } from "./store/index.js";
 import { registerCommunityTools } from "./tools/community-posts.js";
-import { registerRouteSignalTool } from "./tools/route-signal.js";
+import { detectThemes, registerRouteSignalTool } from "./tools/route-signal.js";
 
 const PORT = parseInt(process.env["PORT"] ?? "3000", 10);
 const HOST = process.env["HOST"] ?? "0.0.0.0";
 const COMM_VOICES_API_TOKEN = process.env["COMM_VOICES_API_TOKEN"];
-const db = getNeonClient();
+const CORS_ORIGINS = (process.env["CORS_ORIGINS"] ?? "http://localhost:5173,http://127.0.0.1:5173")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const store = createStore();
+await store.init();
 
 const mcp = new McpServer({
   name: "community-voices-radar",
   version: "1.0.0",
 });
 
-registerCommunityTools(mcp);
-registerRouteSignalTool(mcp, db);
+registerCommunityTools(mcp, store);
+registerRouteSignalTool(mcp, store);
 
 const app = express();
 app.use(express.json());
 app.locals["commVoicesApiToken"] = COMM_VOICES_API_TOKEN;
 
-function requireBearerAuth(req: Request, res: Response): boolean {
-  if (!COMM_VOICES_API_TOKEN) {
-    return true;
-  }
-
-  const authorization = req.header("authorization");
-  const expectedAuthorization = `Bearer ${COMM_VOICES_API_TOKEN}`;
-
-  if (authorization === expectedAuthorization) {
-    return true;
-  }
-
-  res.status(401).json({ error: "Unauthorized" });
-  return false;
-}
-
-function getAllowedQueryValue<T extends readonly string[]>(
-  value: unknown,
-  allowedValues: T,
-): T[number] {
-  return typeof value === "string" && allowedValues.includes(value)
-    ? (value as T[number])
-    : ("all" as T[number]);
-}
-
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-app.use("/community-posts", async (req: Request, res: Response) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  if (req.method !== "GET") {
-    res.status(405).json({ error: "Method Not Allowed" });
-    return;
-  }
-
-  const platform = getAllowedQueryValue(
-    req.query["platform"],
-    COMMUNITY_PLATFORMS,
-  );
-  const region = getAllowedQueryValue(req.query["region"], COMMUNITY_REGIONS);
-  const type = getAllowedQueryValue(req.query["type"], COMMUNITY_TYPES);
-  const limitParam =
-    typeof req.query["limit"] === "string"
-      ? Number.parseInt(req.query["limit"], 10)
-      : undefined;
-
-  const posts = await getCommunityPosts({
-    platform,
-    region,
-    type,
-    ...(limitParam && limitParam > 0 ? { limit: limitParam } : {}),
-  });
-
-  res.type("application/json").status(200).json(posts);
-});
+app.use(createApiRouter(store, { apiToken: COMM_VOICES_API_TOKEN, allowedOrigins: CORS_ORIGINS }));
 
 const transports = new Map<string, SSEServerTransport>();
 
@@ -174,41 +116,17 @@ app.post("/messages", async (req: Request, res: Response) => {
   }
 });
 
-const INSIGHT_KEYWORDS = ["integration", "automation", "agent", "error", "pricing"] as const;
-const INSIGHT_PREFIXES = [
-  "Increasing demand for",
-  "Rising issues around",
-  "Growing interest in",
-] as const;
+const INSIGHT_PREFIXES = ["Increasing demand for", "Rising issues around", "Growing interest in"] as const;
 
 app.get("/insights/acknowledged", async (_req: Request, res: Response) => {
-  const rows = await db<{ content: string }[]>`
-    SELECT content FROM posts WHERE timestamp > NOW() - INTERVAL '24 hours'
-  `;
-
-  const counts: Record<string, number> = {};
-  for (const kw of INSIGHT_KEYWORDS) counts[kw] = 0;
-
-  for (const row of rows) {
-    const lower = row.content.toLowerCase();
-    for (const kw of INSIGHT_KEYWORDS) {
-      if (lower.includes(kw)) counts[kw] = (counts[kw] ?? 0) + 1;
-    }
-  }
-
-  const top = Object.entries(counts)
-    .filter(([, n]) => n > 0)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 3);
-
-  const acknowledged = top.map(
-    ([theme], i) => `${INSIGHT_PREFIXES[i] ?? "Growing interest in"} ${theme}`,
+  const [{ settings }, posts] = await Promise.all([store.getConfig(), store.listPosts({ sinceDays: 1, limit: 1000 })]);
+  const acknowledged = detectThemes(posts, settings.themes, 3).map(
+    (theme, i) => `${INSIGHT_PREFIXES[i] ?? "Growing interest in"} ${theme}`,
   );
-
   res.json({ acknowledged });
 });
 
-const server = app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, HOST, () => {
   const toolCount = (
     mcp as unknown as { _registeredTools: Record<string, unknown> }
   )._registeredTools
@@ -232,14 +150,17 @@ const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(
     `[community-voices-radar] Community endpoint: GET  http://localhost:${PORT}/community-posts`,
   );
+  console.log(`[community-voices-radar] Watchlist storage: ${store.kind}`);
 });
+
+startWeeklySchedule(store);
 process.on("SIGTERM", () => {
   console.log(
     "[community-voices-radar] SIGTERM received - shutting down gracefully",
   );
   server.close(() => {
     console.log("[community-voices-radar] HTTP server closed");
-    void closeNeonClient();
+    void store.close();
     process.exit(0);
   });
 });
