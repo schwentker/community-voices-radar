@@ -9,6 +9,7 @@ import {
   type RadarConfig,
   type Settings,
 } from "../config/schema.js";
+import type { StoredSignal } from "../signals/types.js";
 import { entitiesFromEnv } from "./seed.js";
 import type { PostQuery, ScanRun, ScanTrigger, Store, StoredPost } from "./types.js";
 
@@ -26,6 +27,7 @@ export class MemoryStore implements Store {
   private entities: Entity[] = [];
   private posts = new Map<string, StoredPost>();
   private runs: ScanRun[] = [];
+  private signals = new Map<string, StoredSignal>();
 
   constructor(private readonly configPath: string | null = null) {}
 
@@ -99,7 +101,41 @@ export class MemoryStore implements Store {
       .filter((post) => !query.type || query.type === "all" || post.type === query.type)
       .filter((post) => Date.parse(post.timestamp) >= since)
       .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
-    return structuredClone(rows.slice(0, query.limit ?? 200));
+    return structuredClone(rows.slice(0, query.limit ?? 200).map((post) => this.withSignal(post)));
+  }
+
+  private withSignal(post: StoredPost): StoredPost {
+    const signal = this.signals.get(post.id);
+    return signal ? { ...post, signal } : post;
+  }
+
+  async saveSignal(postId: string, signal: StoredSignal): Promise<void> {
+    const existing = this.signals.get(postId);
+    this.signals.set(postId, existing?.feedback ? { ...signal, feedback: existing.feedback } : signal);
+  }
+
+  async listUnscored(limit: number): Promise<StoredPost[]> {
+    const rows = [...this.posts.values()]
+      .filter((post) => !this.signals.has(post.id))
+      .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+    return structuredClone(rows.slice(0, limit));
+  }
+
+  async listReview(maxConfidence: number, limit: number): Promise<StoredPost[]> {
+    const rows = [...this.posts.values()]
+      .filter((post) => {
+        const signal = this.signals.get(post.id);
+        return signal !== undefined && signal.confidence < maxConfidence && !signal.feedback;
+      })
+      .sort((a, b) => (this.signals.get(b.id)?.importance ?? 0) - (this.signals.get(a.id)?.importance ?? 0));
+    return structuredClone(rows.slice(0, limit).map((post) => this.withSignal(post)));
+  }
+
+  async setFeedback(postId: string, feedback: "right" | "wrong"): Promise<boolean> {
+    const signal = this.signals.get(postId);
+    if (!signal) return false;
+    this.signals.set(postId, { ...signal, feedback });
+    return true;
   }
 
   async saveScanRun(run: ScanRun): Promise<void> {

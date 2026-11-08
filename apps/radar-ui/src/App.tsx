@@ -1,6 +1,7 @@
 import { startTransition, useCallback, useEffect, useMemo, useState } from "react";
 
-import { api, type RadarConfig } from "./api";
+import { api, type RadarConfig, type Signal } from "./api";
+import { CLASS_LABELS, SignalPipelinePanel } from "./SignalPipeline";
 import { WatchlistPanel } from "./Watchlist";
 
 type Platform = "all" | "discourse" | "discord" | "slack" | "reddit";
@@ -17,6 +18,7 @@ interface CommunityPost {
   timestamp: string;
   source?: string;
   entities?: string[];
+  signal?: Signal;
   meta?: { url?: string };
 }
 
@@ -223,6 +225,8 @@ function App() {
   const [entity, setEntity] = useState<string>("all");
   const [config, setConfig] = useState<RadarConfig | null>(null);
   const [watchlistOpen, setWatchlistOpen] = useState(false);
+  const [pipelineOpen, setPipelineOpen] = useState(false);
+  const [sortBy, setSortBy] = useState<"newest" | "importance">("newest");
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -284,11 +288,14 @@ function App() {
   const maxMentions = Math.max(...mentionsByEntity.map(([, count]) => count), 1);
 
   const filteredPosts = useMemo(() => {
-    return scopedPosts.filter((post) => {
+    const matching = scopedPosts.filter((post) => {
       const matchesType = type === "all" || post.type === type;
       return matchesType;
     });
-  }, [scopedPosts, type]);
+    return sortBy === "importance"
+      ? [...matching].sort((a, b) => (b.signal?.importance ?? -1) - (a.signal?.importance ?? -1))
+      : matching;
+  }, [scopedPosts, type, sortBy]);
 
   const topRegions = useMemo(() => {
     const counts = scopedPosts.reduce<Record<string, number>>((accumulator, post) => {
@@ -386,6 +393,13 @@ function App() {
                 >
                   {entities.length ? "Edit watchlist" : "Set up watchlist"}
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setPipelineOpen(true)}
+                  className="rounded-full border border-white/40 px-4 py-1.5 text-sm font-semibold text-white transition hover:bg-white/10"
+                >
+                  Signal pipeline
+                </button>
               </div>
             </div>
             <div className="grid gap-3 sm:grid-cols-3">
@@ -435,6 +449,15 @@ function App() {
                   Posts stored by scans. Run a scan from the watchlist to pull fresh ones.
                 </p>
               </div>
+              <select
+                aria-label="Sort posts"
+                className="rounded-full border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700"
+                value={sortBy}
+                onChange={(event) => setSortBy(event.target.value as "newest" | "importance")}
+              >
+                <option value="newest">Newest first</option>
+                <option value="importance">Most important first</option>
+              </select>
               <button
                 type="button"
                 onClick={() => void refreshPosts()}
@@ -499,6 +522,17 @@ function App() {
                             <span className="inline-flex rounded-full bg-slate-900 px-3 py-1 text-xs font-medium text-white">
                               {TYPE_LABELS[post.type] ?? post.type}
                             </span>
+                            {post.signal ? (
+                              <span
+                                className="inline-flex items-center gap-1.5 rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-xs font-semibold text-radar-purple"
+                                title={`${post.signal.engine}: ${post.signal.reasons.join("; ")}`}
+                              >
+                                {CLASS_LABELS[post.signal.signalClass] ?? post.signal.signalClass}
+                                <span className="font-medium text-slate-500">
+                                  imp {post.signal.importance.toFixed(2)} / conf {post.signal.confidence.toFixed(2)}
+                                </span>
+                              </span>
+                            ) : null}
                             {(post.entities ?? []).map((entityId) => {
                               const tagged = entityById.get(entityId);
                               return (
@@ -717,6 +751,13 @@ function App() {
           </aside>
         </main>
       </div>
+      <SignalPipelinePanel
+        open={pipelineOpen}
+        config={config}
+        onClose={() => setPipelineOpen(false)}
+        onChanged={() => void loadConfig()}
+        onScored={() => void loadPosts()}
+      />
       <WatchlistPanel
         open={watchlistOpen}
         config={config}

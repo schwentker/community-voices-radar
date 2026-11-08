@@ -16,7 +16,65 @@ export interface Entity {
   enabled: boolean;
 }
 
+export type SignalClass =
+  | "question"
+  | "feature_request"
+  | "pain_point"
+  | "discussion"
+  | "churn_risk"
+  | "competitor_switch"
+  | "security_outage"
+  | "praise";
+
+export interface PipelineSettings {
+  engine: "rules" | "jev";
+  weights: { urgency: number; reach: number; business: number };
+  reviewConfidence: number;
+  extraClasses: SignalClass[];
+}
+
+export interface Signal {
+  signalClass: SignalClass;
+  importance: number;
+  confidence: number;
+  reasons: string[];
+  engine: string;
+  scoredAt: string;
+  feedback?: "right" | "wrong";
+}
+
+export interface ScoreSummary {
+  considered: number;
+  scored: number;
+  byEngine: Record<string, number>;
+  capHit: string | null;
+  note: string | null;
+  attempts: number;
+  reservedTokens: number;
+  costUsd: number;
+}
+
+export interface Caps {
+  concurrency: number;
+  maxAttempts: number;
+  maxInputTokens: number;
+  maxCostUsd: number;
+  timeoutMs: number;
+  maxRetries: number;
+  maxStateChars: number;
+}
+
+export interface ReviewPost {
+  id: string;
+  content: string;
+  platform: string;
+  entities: string[];
+  signal: Signal;
+  meta?: { url?: string };
+}
+
 export interface Settings {
+  pipeline: PipelineSettings;
   workspaceName: string;
   themes: string[];
   includeSynthetic: boolean;
@@ -112,6 +170,11 @@ export const api = {
   preview: (entity: Entity) => request<PreviewResult>("/config/preview", { method: "POST", body: JSON.stringify(entity) }),
   scan: (entityIds?: string[]) =>
     request<ScanRun>("/scan", { method: "POST", body: JSON.stringify(entityIds ? { entityIds } : {}) }),
+  caps: () => request<{ caps: Caps; jevKeySet: boolean; scoring: boolean }>("/signals/caps"),
+  scoreNow: () => request<ScoreSummary>("/signals/score", { method: "POST", body: "{}" }),
+  review: () => request<{ threshold: number; posts: ReviewPost[] }>("/signals/review"),
+  feedback: (postId: string, verdict: "right" | "wrong") =>
+    request<void>(`/signals/${encodeURIComponent(postId)}/feedback`, { method: "POST", body: JSON.stringify({ verdict }) }),
   scanRuns: () => request<{ running: boolean; runs: ScanRun[] }>("/scan/runs"),
 };
 
