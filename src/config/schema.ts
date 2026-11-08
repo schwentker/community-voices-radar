@@ -61,7 +61,38 @@ export const DEFAULT_THEMES = [
   "agent",
 ];
 
+export const SIGNAL_CLASSES = [
+  "question",
+  "feature_request",
+  "pain_point",
+  "discussion",
+  "churn_risk",
+  "competitor_switch",
+  "security_outage",
+  "praise",
+] as const;
+export type SignalClass = (typeof SIGNAL_CLASSES)[number];
+export const BASE_SIGNAL_CLASSES: SignalClass[] = ["question", "feature_request", "pain_point", "discussion"];
+
+export const pipelineSchema = z.object({
+  // "jev" falls back to local rules until the Jev adapter is wired.
+  engine: z.enum(["rules", "jev"]).default("rules"),
+  // Relative weights, urgency first. Normalized when scoring.
+  weights: z
+    .object({
+      urgency: z.number().min(0).max(100).default(50),
+      reach: z.number().min(0).max(100).default(30),
+      business: z.number().min(0).max(100).default(20),
+    })
+    .default({}),
+  // Posts scored below this confidence go to the human review queue.
+  reviewConfidence: z.number().min(0).max(1).default(0.5),
+  // Extra classes beyond the four basics.
+  extraClasses: z.array(z.enum(SIGNAL_CLASSES)).default(["churn_risk", "competitor_switch", "security_outage", "praise"]),
+});
+
 export const settingsSchema = z.object({
+  pipeline: pipelineSchema.default({}),
   workspaceName: z.string().trim().min(1).max(80).default("Community Voices"),
   themes: termList(30).default(DEFAULT_THEMES),
   includeSynthetic: z.boolean().default(false),
@@ -82,6 +113,7 @@ export const settingsSchema = z.object({
 export type Entity = z.infer<typeof entitySchema>;
 export type EntityInput = z.input<typeof entitySchema>;
 export type Settings = z.infer<typeof settingsSchema>;
+export type PipelineSettings = z.infer<typeof pipelineSchema>;
 export type SettingsInput = z.input<typeof settingsSchema>;
 
 export interface RadarConfig {

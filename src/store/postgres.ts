@@ -9,6 +9,7 @@ import {
   type Settings,
 } from "../config/schema.js";
 import { closeNeonClient, getNeonClient, persistPost } from "../db/neon.js";
+import type { StoredSignal } from "../signals/types.js";
 import { entitiesFromEnv } from "./seed.js";
 import type { PostQuery, ScanRun, ScanTrigger, Store, StoredPost } from "./types.js";
 
@@ -35,6 +36,17 @@ const MIGRATIONS = [
      PRIMARY KEY (post_id, entity_id)
    )`,
   `CREATE INDEX IF NOT EXISTS idx_post_entities_entity ON post_entities(entity_id)`,
+  `CREATE TABLE IF NOT EXISTS post_signals (
+     post_id TEXT PRIMARY KEY REFERENCES posts(id) ON DELETE CASCADE,
+     signal_class TEXT NOT NULL,
+     importance REAL NOT NULL,
+     confidence REAL NOT NULL,
+     engine TEXT NOT NULL,
+     reasons JSONB NOT NULL DEFAULT '[]'::jsonb,
+     feedback TEXT,
+     scored_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_post_signals_confidence ON post_signals(confidence)`,
   `CREATE TABLE IF NOT EXISTS scan_runs (
      id TEXT PRIMARY KEY,
      trigger TEXT NOT NULL,
@@ -58,6 +70,13 @@ interface PostRow {
   source: string | null;
   meta: Record<string, unknown> | null;
   entities: string[] | null;
+  signal_class: StoredSignal["signalClass"] | null;
+  importance: number | null;
+  confidence: number | null;
+  engine: string | null;
+  reasons: string[] | null;
+  feedback: "right" | "wrong" | null;
+  scored_at: Date | string | null;
 }
 
 interface ScanRow {
@@ -67,6 +86,34 @@ interface ScanRow {
   started_at: Date;
   finished_at: Date | null;
   stats: ScanRun["stats"];
+}
+
+function toStoredPost(row: PostRow): StoredPost {
+  const post: StoredPost = {
+    id: row.id,
+    external_id: row.external_id ?? row.id,
+    platform: row.platform,
+    author: row.author ?? "unknown",
+    region: row.region ?? "unknown",
+    content: row.content ?? "",
+    type: row.type ?? "discussion",
+    timestamp: new Date(row.timestamp).toISOString(),
+    source: row.source ?? `${row.platform}_live`,
+    meta: row.meta ?? {},
+    entities: row.entities ?? [],
+  };
+  if (row.signal_class && row.importance !== null && row.confidence !== null && row.engine && row.scored_at) {
+    post.signal = {
+      signalClass: row.signal_class,
+      importance: row.importance,
+      confidence: row.confidence,
+      reasons: row.reasons ?? [],
+      engine: row.engine,
+      scoredAt: new Date(row.scored_at).toISOString(),
+      ...(row.feedback ? { feedback: row.feedback } : {}),
+    };
+  }
+  return post;
 }
 
 export class PostgresStore implements Store {
@@ -146,33 +193,72 @@ export class PostgresStore implements Store {
     const rows = await db<PostRow[]>`
       SELECT p.id, p.external_id, p.platform, p.author, p.region, p.content, p.type,
              p.timestamp, p.source, p.meta,
-             COALESCE(array_agg(pe.entity_id) FILTER (WHERE pe.entity_id IS NOT NULL), '{}') AS entities
+             COALESCE(array_agg(pe.entity_id) FILTER (WHERE pe.entity_id IS NOT NULL), '{}') AS entities,
+             ps.signal_class, ps.importance, ps.confidence, ps.engine, ps.reasons, ps.feedback, ps.scored_at
       FROM posts p
       LEFT JOIN post_entities pe ON pe.post_id = p.id
+      LEFT JOIN post_signals ps ON ps.post_id = p.id
       WHERE TRUE
         ${query.entity ? db`AND EXISTS (SELECT 1 FROM post_entities x WHERE x.post_id = p.id AND x.entity_id = ${query.entity})` : empty}
         ${query.platform && query.platform !== "all" ? db`AND p.platform = ${query.platform}` : empty}
         ${query.region && query.region !== "all" ? db`AND p.region = ${query.region}` : empty}
         ${query.type && query.type !== "all" ? db`AND p.type = ${query.type}` : empty}
         ${query.sinceDays ? db`AND p.timestamp > NOW() - make_interval(days => ${query.sinceDays})` : empty}
-      GROUP BY p.id
+      GROUP BY p.id, ps.post_id
       ORDER BY p.timestamp DESC
       LIMIT ${query.limit ?? 200}
     `;
 
-    return rows.map((row) => ({
-      id: row.id,
-      external_id: row.external_id ?? row.id,
-      platform: row.platform,
-      author: row.author ?? "unknown",
-      region: row.region ?? "unknown",
-      content: row.content ?? "",
-      type: row.type ?? "discussion",
-      timestamp: new Date(row.timestamp).toISOString(),
-      source: row.source ?? `${row.platform}_live`,
-      meta: row.meta ?? {},
-      entities: row.entities ?? [],
-    }));
+    return rows.map(toStoredPost);
+  }
+
+  async saveSignal(postId: string, signal: StoredSignal): Promise<void> {
+    await this.db`
+      INSERT INTO post_signals (post_id, signal_class, importance, confidence, engine, reasons, scored_at)
+      VALUES (${postId}, ${signal.signalClass}, ${signal.importance}, ${signal.confidence}, ${signal.engine},
+              ${this.db.json(signal.reasons as never)}, ${signal.scoredAt})
+      ON CONFLICT (post_id) DO UPDATE SET
+        signal_class = EXCLUDED.signal_class, importance = EXCLUDED.importance,
+        confidence = EXCLUDED.confidence, engine = EXCLUDED.engine,
+        reasons = EXCLUDED.reasons, scored_at = EXCLUDED.scored_at
+    `;
+  }
+
+  async listUnscored(limit: number): Promise<StoredPost[]> {
+    const rows = await this.db<PostRow[]>`
+      SELECT p.id, p.external_id, p.platform, p.author, p.region, p.content, p.type, p.timestamp, p.source, p.meta,
+             COALESCE(array_agg(pe.entity_id) FILTER (WHERE pe.entity_id IS NOT NULL), '{}') AS entities,
+             NULL::text AS signal_class, NULL::real AS importance, NULL::real AS confidence, NULL::text AS engine,
+             NULL::jsonb AS reasons, NULL::text AS feedback, NULL::timestamptz AS scored_at
+      FROM posts p
+      LEFT JOIN post_entities pe ON pe.post_id = p.id
+      WHERE NOT EXISTS (SELECT 1 FROM post_signals s WHERE s.post_id = p.id)
+      GROUP BY p.id
+      ORDER BY p.timestamp DESC
+      LIMIT ${limit}
+    `;
+    return rows.map(toStoredPost);
+  }
+
+  async listReview(maxConfidence: number, limit: number): Promise<StoredPost[]> {
+    const rows = await this.db<PostRow[]>`
+      SELECT p.id, p.external_id, p.platform, p.author, p.region, p.content, p.type, p.timestamp, p.source, p.meta,
+             COALESCE(array_agg(pe.entity_id) FILTER (WHERE pe.entity_id IS NOT NULL), '{}') AS entities,
+             ps.signal_class, ps.importance, ps.confidence, ps.engine, ps.reasons, ps.feedback, ps.scored_at
+      FROM post_signals ps
+      JOIN posts p ON p.id = ps.post_id
+      LEFT JOIN post_entities pe ON pe.post_id = p.id
+      WHERE ps.confidence < ${maxConfidence} AND ps.feedback IS NULL
+      GROUP BY p.id, ps.post_id
+      ORDER BY ps.importance DESC
+      LIMIT ${limit}
+    `;
+    return rows.map(toStoredPost);
+  }
+
+  async setFeedback(postId: string, feedback: "right" | "wrong"): Promise<boolean> {
+    const updated = await this.db`UPDATE post_signals SET feedback = ${feedback} WHERE post_id = ${postId} RETURNING post_id`;
+    return updated.length > 0;
   }
 
   async saveScanRun(run: ScanRun): Promise<void> {

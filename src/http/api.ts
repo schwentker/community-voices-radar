@@ -8,6 +8,7 @@ import { buildRedditQuery } from "../config/query.js";
 import { searchReddit } from "../sources/reddit.js";
 import { getCommunityPosts } from "../sources/community-posts.js";
 import { isScanRunning, runScan } from "../scan.js";
+import { capsFromEnv, scorePosts } from "../signals/runner.js";
 import type { Store } from "../store/types.js";
 
 // REST API for the radar UI. Reads are open (CORS *). Writes need:
@@ -201,6 +202,58 @@ export function createApiRouter(store: Store, options: ApiOptions): Router {
     "/scan/runs",
     wrap(async (_req, res) => {
       res.json({ running: isScanRunning(), runs: await store.listScanRuns(10) });
+    }),
+  );
+
+  // ── Signals (class, importance, confidence) ─────────────────────────────
+  let scoring = false;
+
+  router.get(
+    "/signals/caps",
+    wrap(async (_req, res) => {
+      res.json({ caps: capsFromEnv(), jevKeySet: Boolean(process.env["TYPESAFE_API_KEY"]), scoring });
+    }),
+  );
+
+  router.post(
+    "/signals/score",
+    requireWrite,
+    wrap(async (_req, res) => {
+      if (scoring) {
+        res.status(409).json({ error: "A scoring run is already in progress" });
+        return;
+      }
+      scoring = true;
+      try {
+        res.json(await scorePosts(store));
+      } finally {
+        scoring = false;
+      }
+    }),
+  );
+
+  router.get(
+    "/signals/review",
+    wrap(async (_req, res) => {
+      const { settings } = await store.getConfig();
+      res.json({
+        threshold: settings.pipeline.reviewConfidence,
+        posts: await store.listReview(settings.pipeline.reviewConfidence, 50),
+      });
+    }),
+  );
+
+  router.post(
+    "/signals/:postId/feedback",
+    requireWrite,
+    wrap(async (req, res) => {
+      const parsed = z.object({ verdict: z.enum(["right", "wrong"]) }).safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: "verdict must be right or wrong" });
+        return;
+      }
+      const ok = await store.setFeedback(String(req.params["postId"] ?? ""), parsed.data.verdict);
+      res.status(ok ? 204 : 404).end();
     }),
   );
 

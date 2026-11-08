@@ -56,10 +56,10 @@ test("classifies intent with per-company pain keywords", () => {
 
 test("seeds one default entity from the old env vars", () => {
   assert.deepEqual(entitiesFromEnv({}), []);
-  const [seeded] = entitiesFromEnv({ REDDIT_SEARCH_QUERY: "mcp server", DISCOURSE_BASE_URLS: "https://forum.example.com/" });
+  const [seeded] = entitiesFromEnv({ REDDIT_SEARCH_QUERY: "mcp server", DISCOURSE_BASE_URLS: "https://forum.acme.dev/" });
   assert.equal(seeded?.id, "default");
   assert.equal(seeded?.sources.reddit.query, "mcp server");
-  assert.deepEqual(seeded?.sources.discourse.forums, ["https://forum.example.com"]);
+  assert.deepEqual(seeded?.sources.discourse.forums, ["https://forum.acme.dev"]);
 });
 
 test("Shopify + competitors preset is valid", () => {
@@ -113,4 +113,99 @@ test("scan fetches per entity, tags cross-mentions, persists, records run", asyn
 
   const saved = JSON.parse(await readFile(join(dir, "watchlist.json"), "utf8")) as { entities: unknown[] };
   assert.equal(saved.entities.length, 5);
+});
+
+// ── Signal pipeline ──────────────────────────────────────────────────────────
+import { scoreWithRules } from "../src/signals/rules.js";
+import { Budget, capsFromEnv, scorePosts } from "../src/signals/runner.js";
+import { BudgetExceededError, type Decider } from "../src/signals/types.js";
+
+const baseInput = {
+  postId: "p",
+  text: "",
+  platform: "reddit",
+  postType: "discussion",
+  company: "Shopify",
+  otherCompanies: [] as string[],
+  ageHours: 1,
+  rank: 0,
+  painKeywords: [] as string[],
+};
+const rulesCtx = { weights: { urgency: 50, reach: 30, business: 20 }, allowedClasses: ["churn_risk", "competitor_switch", "security_outage", "praise"] as never };
+
+test("rules classify churn, outage, switch, praise, question", () => {
+  assert.equal(scoreWithRules({ ...baseInput, text: "We are moving off Shopify, fees are killing us" }, rulesCtx).signalClass, "churn_risk");
+  assert.equal(scoreWithRules({ ...baseInput, text: "Webhook deliveries stopped working this morning" }, rulesCtx).signalClass, "security_outage");
+  assert.equal(
+    scoreWithRules({ ...baseInput, text: "Thinking about switching to WooCommerce", otherCompanies: ["WooCommerce"] }, rulesCtx).signalClass,
+    "competitor_switch",
+  );
+  assert.equal(scoreWithRules({ ...baseInput, text: "Love the new editor, thanks" }, rulesCtx).signalClass, "praise");
+  assert.equal(scoreWithRules({ ...baseInput, text: "How do I add a metafield?" }, rulesCtx).signalClass, "question");
+});
+
+test("disabled extra classes fall back to base classes; weights drive importance", () => {
+  const off = scoreWithRules({ ...baseInput, text: "Love the new editor, thanks" }, { ...rulesCtx, allowedClasses: [] });
+  assert.equal(off.signalClass, "discussion");
+  const urgentOnly = scoreWithRules({ ...baseInput, text: "Checkout is down in production" }, { ...rulesCtx, weights: { urgency: 100, reach: 0, business: 0 } });
+  const reachOnly = scoreWithRules({ ...baseInput, text: "Checkout is down in production" }, { ...rulesCtx, weights: { urgency: 0, reach: 100, business: 0 } });
+  assert.ok(urgentOnly.importance > reachOnly.importance);
+});
+
+test("budget reserves before attempts and enforces each cap", () => {
+  const caps = { ...capsFromEnv({}), maxAttempts: 2, maxInputTokens: 100, maxCostUsd: 1 };
+  const budget = new Budget(caps);
+  budget.reserve(10);
+  budget.reserve(10);
+  assert.throws(() => budget.reserve(10), BudgetExceededError);
+  const tokens = new Budget({ ...caps, maxAttempts: 99 });
+  assert.throws(() => tokens.reserve(101), BudgetExceededError);
+  const cost = new Budget({ ...caps, maxAttempts: 99 });
+  cost.charge(1);
+  assert.throws(() => cost.reserve(1), BudgetExceededError);
+});
+
+test("scoring run falls back to rules when the cap is hit, and stores everything", async () => {
+  const store = new MemoryStore(null);
+  await store.init();
+  await store.upsertEntity(entitySchema.parse({ id: "shopify", name: "Shopify" }));
+  for (let i = 0; i < 5; i += 1) {
+    await store.savePost(
+      { id: `r${i}`, external_id: `r${i}`, platform: "reddit", author: "a", region: "unknown", content: `Shopify checkout is down ${i}`, type: "discussion", timestamp: new Date(Date.now() - i * 1000).toISOString(), source: "reddit_live", meta: { rank: i } },
+      ["shopify"],
+    );
+  }
+  const jevLike: Decider = {
+    name: "jev",
+    async decide(input) {
+      return { signalClass: "pain_point", importance: 0.9, confidence: 0.95, reasons: ["fake"], usage: { inputTokens: 10, costUsd: 0.4 }, ...(input ? {} : {}) };
+    },
+  };
+  const summary = await scorePosts(store, {
+    primary: jevLike,
+    caps: { ...capsFromEnv({}), maxCostUsd: 1, concurrency: 1 },
+  });
+  assert.equal(summary.scored, 5);
+  assert.equal(summary.byEngine["jev"], 3); // 0.4 + 0.4 + 0.4 crosses the $1 cap after the third
+  assert.equal(summary.byEngine["rules-fallback"], 2);
+  assert.equal(summary.capHit, "max cost per run");
+  assert.equal((await store.listUnscored(10)).length, 0);
+});
+
+test("unwired Jev falls back to rules with a note; feedback leaves the review queue", async () => {
+  const store = new MemoryStore(null);
+  await store.init();
+  const settings = (await store.getConfig()).settings;
+  await store.saveSettings(settingsSchema.parse({ ...settings, pipeline: { ...settings.pipeline, engine: "jev" } }));
+  await store.savePost(
+    { id: "x1", external_id: "x1", platform: "reddit", author: "a", region: "unknown", content: "Is this a bug or a feature request?", type: "question", timestamp: new Date().toISOString(), source: "reddit_live", meta: {} },
+    [],
+  );
+  const summary = await scorePosts(store, { caps: capsFromEnv({}) });
+  assert.match(summary.note ?? "", /not wired|TYPESAFE_API_KEY/);
+  assert.equal(summary.byEngine["rules-fallback"], 1);
+  const review = await store.listReview(0.99, 10);
+  assert.equal(review.length, 1);
+  assert.equal(await store.setFeedback("x1", "right"), true);
+  assert.equal((await store.listReview(0.99, 10)).length, 0);
 });
